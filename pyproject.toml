@@ -1,2 +1,8 @@
-[tool.vercel]
-entrypoint = "license_server:app"
+[project]
+name = "tweetpipeline-license-server"
+version = "1.0.0"
+description = "Tweet Pipeline Pro license server"
+requires-python = ">=3.11"
+
+[project.scripts]
+app = "license_server:app"

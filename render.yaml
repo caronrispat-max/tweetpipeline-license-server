@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tweetpipeline-license-server
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn license_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TPP_SERVER_ADMIN_TOKEN
+        sync: false
+      - key: DARAJA_ENV
+        value: sandbox

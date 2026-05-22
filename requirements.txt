@@ -1,5 +1,4 @@
-fastapi
-uvicorn
-requests
-pydantic
-python-multipart
+fastapi>=0.115.0
+requests>=2.32.0
+pydantic>=2.7.0
+python-multipart>=0.0.9

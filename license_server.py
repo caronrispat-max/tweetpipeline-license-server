@@ -4,41 +4,51 @@ import base64
 import hashlib
 import os
 import secrets
-import sqlite3
 import string
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from requests.auth import HTTPBasicAuth
 
-BASE_DIR = Path(__file__).resolve().parent
+app = FastAPI(title="Tweet Pipeline Pro License Server - Supabase")
 
-# VERCEL FIX:
-# Serverless functions cannot write beside source files.
-# On Vercel, SQLite must use /tmp. This is for testing only;
-# use Supabase/Postgres later for real paid customers.
-if os.getenv("VERCEL"):
-    DATA_DIR = Path("/tmp")
-else:
-    DATA_DIR = BASE_DIR
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = Path("/tmp/license_server.db")
-
-DEFAULT_ADMIN_TOKEN = (
-    os.getenv("LICENSE_SERVER_ADMIN_TOKEN")
-    or os.getenv("TPP_SERVER_ADMIN_TOKEN")
-    or "change-this-admin-token"
+# ---------------------------------------------------------------------
+# Environment / defaults
+# ---------------------------------------------------------------------
+DEFAULT_ADMIN_TOKEN = os.getenv(
+    "TPP_SERVER_ADMIN_TOKEN",
+    os.getenv("LICENSE_SERVER_ADMIN_TOKEN", "change-this-admin-token"),
 )
 
-app = FastAPI(title="Tweet Pipeline Pro License Server")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
+ENV_DEFAULTS: Dict[str, str] = {
+    "DARAJA_ENV": os.getenv("DARAJA_ENV", "sandbox"),
+    "DARAJA_CONSUMER_KEY": os.getenv("DARAJA_CONSUMER_KEY", ""),
+    "DARAJA_CONSUMER_SECRET": os.getenv("DARAJA_CONSUMER_SECRET", ""),
+    "DARAJA_SHORTCODE": os.getenv("DARAJA_SHORTCODE", "174379"),
+    "DARAJA_PASSKEY": os.getenv("DARAJA_PASSKEY", ""),
+    "DARAJA_CALLBACK_URL": os.getenv("CALLBACK_URL", os.getenv("DARAJA_CALLBACK_URL", "")),
+    "WEEKLY_PRICE": os.getenv("WEEKLY_PRICE", "500"),
+    "MONTHLY_PRICE": os.getenv("MONTHLY_PRICE", os.getenv("DEFAULT_AMOUNT", "1500")),
+    "LIFETIME_PRICE": os.getenv("LIFETIME_PRICE", "15000"),
+    "LICENSE_DAYS_WEEKLY": os.getenv("LICENSE_DAYS_WEEKLY", "7"),
+    "LICENSE_DAYS_MONTHLY": os.getenv("LICENSE_DAYS", os.getenv("LICENSE_DAYS_MONTHLY", "30")),
+    "LICENSE_DAYS_LIFETIME": os.getenv("LICENSE_DAYS_LIFETIME", "36500"),
+    "SERVER_ADMIN_TOKEN": DEFAULT_ADMIN_TOKEN,
+    "ACCOUNT_REFERENCE": os.getenv("ACCOUNT_REFERENCE", "TweetPro"),
+    "TRANSACTION_DESC": os.getenv("TRANSACTION_DESC", "License"),
+}
 
+# ---------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------
 class PaymentStartRequest(BaseModel):
     phone: str
     plan: str = "monthly"
@@ -57,115 +67,129 @@ class LicenseCheckRequest(BaseModel):
     device_id: Optional[str] = None
 
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=20)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA busy_timeout=5000;")
-        # WAL is useful locally but can be unnecessary in serverless.
-        if not os.getenv("VERCEL"):
-            conn.execute("PRAGMA journal_mode=WAL;")
-    except Exception:
-        pass
-    return conn
-
-
-def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                plan TEXT NOT NULL,
-                device_id TEXT DEFAULT '',
-                merchant_request_id TEXT DEFAULT '',
-                checkout_request_id TEXT UNIQUE,
-                status TEXT NOT NULL DEFAULT 'pending',
-                result_code INTEGER,
-                result_desc TEXT DEFAULT '',
-                mpesa_receipt TEXT DEFAULT '',
-                username TEXT DEFAULT '',
-                temp_password TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                paid_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                phone TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                plan TEXT NOT NULL,
-                license_expiry TEXT,
-                device_id TEXT DEFAULT '',
-                token TEXT UNIQUE NOT NULL,
-                must_change_password INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                last_login TEXT
-            );
-            """
+def require_supabase() -> None:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in Vercel environment variables.",
         )
-        defaults = {
-            "DARAJA_ENV": "sandbox",
-            "DARAJA_CONSUMER_KEY": os.getenv("DARAJA_CONSUMER_KEY", ""),
-            "DARAJA_CONSUMER_SECRET": os.getenv("DARAJA_CONSUMER_SECRET", ""),
-            "DARAJA_SHORTCODE": os.getenv("DARAJA_SHORTCODE", "174379"),
-            "DARAJA_PASSKEY": os.getenv("DARAJA_PASSKEY", ""),
-            "DARAJA_CALLBACK_URL": os.getenv("DARAJA_CALLBACK_URL", os.getenv("CALLBACK_URL", "")),
-            "WEEKLY_PRICE": os.getenv("WEEKLY_PRICE", "500"),
-            "MONTHLY_PRICE": os.getenv("MONTHLY_PRICE", "1500"),
-            "LIFETIME_PRICE": os.getenv("LIFETIME_PRICE", "15000"),
-            "LICENSE_DAYS_WEEKLY": os.getenv("LICENSE_DAYS_WEEKLY", "7"),
-            "LICENSE_DAYS_MONTHLY": os.getenv("LICENSE_DAYS", "30"),
-            "LICENSE_DAYS_LIFETIME": os.getenv("LICENSE_DAYS_LIFETIME", "36500"),
-            "SERVER_ADMIN_TOKEN": DEFAULT_ADMIN_TOKEN,
-            "ACCOUNT_REFERENCE": "TweetPro",
-            "TRANSACTION_DESC": "License",
-        }
-        now = utc_now()
-        for k, v in defaults.items():
-            conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)", (k, str(v), now))
-        conn.commit()
+
+
+def sb_headers(prefer: Optional[str] = None) -> Dict[str, str]:
+    require_supabase()
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def sb_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def sb_select(table: str, params: Dict[str, str]) -> list[dict[str, Any]]:
+    response = requests.get(sb_url(table), headers=sb_headers(), params=params, timeout=30)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=500, detail={"supabase_select_error": response.text, "table": table})
+    return response.json()
+
+
+def sb_insert(table: str, payload: Dict[str, Any]) -> list[dict[str, Any]]:
+    response = requests.post(
+        sb_url(table),
+        headers=sb_headers("return=representation"),
+        json=payload,
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=500, detail={"supabase_insert_error": response.text, "table": table})
+    return response.json()
+
+
+def sb_update(table: str, filters: Dict[str, str], payload: Dict[str, Any]) -> list[dict[str, Any]]:
+    response = requests.patch(
+        sb_url(table),
+        headers=sb_headers("return=representation"),
+        params=filters,
+        json=payload,
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=500, detail={"supabase_update_error": response.text, "table": table})
+    return response.json()
+
+
+def sb_upsert(table: str, payload: Dict[str, Any], on_conflict: str) -> list[dict[str, Any]]:
+    response = requests.post(
+        sb_url(table),
+        headers=sb_headers("resolution=merge-duplicates,return=representation"),
+        params={"on_conflict": on_conflict},
+        json=payload,
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=500, detail={"supabase_upsert_error": response.text, "table": table})
+    return response.json()
 
 
 def setting(key: str, default: str = "") -> str:
-    with db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return str(row["value"]) if row else default
+    # Environment variables are always fallback. Supabase settings override them.
+    fallback = ENV_DEFAULTS.get(key, os.getenv(key, default))
+    try:
+        rows = sb_select("settings", {"select": "value", "key": f"eq.{key}", "limit": "1"})
+        if rows:
+            return str(rows[0].get("value", fallback))
+    except HTTPException:
+        # During first setup before schema is created, keep app usable enough to show clear home/admin errors.
+        pass
+    return str(fallback if fallback is not None else default)
 
 
 def set_setting(key: str, value: Any) -> None:
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, str(value), utc_now()),
-        )
-        conn.commit()
+    sb_upsert(
+        "settings",
+        {"key": key, "value": str(value), "updated_at": utc_now()},
+        "key",
+    )
 
 
 def all_settings(mask_secret: bool = False) -> Dict[str, str]:
-    with db() as conn:
-        rows = conn.execute("SELECT key,value FROM settings ORDER BY key").fetchall()
-    result = {r["key"]: r["value"] for r in rows}
+    result = dict(ENV_DEFAULTS)
+    try:
+        rows = sb_select("settings", {"select": "key,value", "order": "key.asc"})
+        for row in rows:
+            result[str(row["key"])] = str(row.get("value", ""))
+    except HTTPException:
+        pass
     if mask_secret:
         for k in list(result):
-            if "SECRET" in k or "PASSKEY" in k or "TOKEN" in k:
+            if any(s in k for s in ["SECRET", "PASSKEY", "TOKEN", "KEY"]):
                 v = result[k]
                 result[k] = "" if not v else (v[:4] + "..." + v[-4:] if len(v) > 10 else "********")
     return result
+
+
+def ensure_default_settings() -> None:
+    # Safe to call often. Keeps Supabase settings table populated.
+    for key, value in ENV_DEFAULTS.items():
+        try:
+            rows = sb_select("settings", {"select": "key", "key": f"eq.{key}", "limit": "1"})
+            if not rows:
+                set_setting(key, value)
+        except HTTPException:
+            # If schema not created yet, /health will reveal it.
+            return
 
 
 def require_admin(x_admin_token: Optional[str] = Header(default=None)) -> None:
@@ -206,22 +230,29 @@ def generate_temp_password(length: int = 10) -> str:
     return raw[:4] + "-" + raw[4:8] + "-" + raw[8:]
 
 
+def safe_int(value: Any, default: int) -> int:
+    try:
+        return int(float(str(value)))
+    except Exception:
+        return default
+
+
 def plan_amount(plan: str) -> int:
     plan = (plan or "monthly").lower()
     if plan == "weekly":
-        return int(float(setting("WEEKLY_PRICE", "500") or 500))
+        return safe_int(setting("WEEKLY_PRICE", "500"), 500)
     if plan == "lifetime":
-        return int(float(setting("LIFETIME_PRICE", "15000") or 15000))
-    return int(float(setting("MONTHLY_PRICE", "1500") or 1500))
+        return safe_int(setting("LIFETIME_PRICE", "15000"), 15000)
+    return safe_int(setting("MONTHLY_PRICE", "1500"), 1500)
 
 
 def plan_days(plan: str) -> int:
     plan = (plan or "monthly").lower()
     if plan == "weekly":
-        return int(setting("LICENSE_DAYS_WEEKLY", "7") or 7)
+        return safe_int(setting("LICENSE_DAYS_WEEKLY", "7"), 7)
     if plan == "lifetime":
-        return int(setting("LICENSE_DAYS_LIFETIME", "36500") or 36500)
-    return int(setting("LICENSE_DAYS_MONTHLY", "30") or 30)
+        return safe_int(setting("LICENSE_DAYS_LIFETIME", "36500"), 36500)
+    return safe_int(setting("LICENSE_DAYS_MONTHLY", "30"), 30)
 
 
 def token_url() -> str:
@@ -240,7 +271,7 @@ def get_access_token() -> str:
     key = setting("DARAJA_CONSUMER_KEY")
     secret = setting("DARAJA_CONSUMER_SECRET")
     if not key or not secret:
-        raise HTTPException(status_code=400, detail="Daraja Consumer Key/Secret not configured on server admin page.")
+        raise HTTPException(status_code=400, detail="Daraja Consumer Key/Secret not configured.")
     response = requests.get(token_url(), auth=HTTPBasicAuth(key, secret), timeout=30)
     try:
         data = response.json()
@@ -255,7 +286,7 @@ def build_stk_password(timestamp: str) -> str:
     shortcode = setting("DARAJA_SHORTCODE", "174379")
     passkey = setting("DARAJA_PASSKEY")
     if not passkey:
-        raise HTTPException(status_code=400, detail="Daraja Passkey not configured on server admin page.")
+        raise HTTPException(status_code=400, detail="Daraja Passkey not configured.")
     raw = f"{shortcode}{passkey}{timestamp}"
     return base64.b64encode(raw.encode()).decode()
 
@@ -267,39 +298,61 @@ def create_or_update_paid_user(phone: str, plan: str, device_id: str) -> Dict[st
     days = plan_days(plan)
     expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds")
     token = secrets.token_urlsafe(32)
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO users(username, phone, password_hash, status, plan, license_expiry, device_id, token, must_change_password, created_at)
-            VALUES(?,?,?,?,?,?,?,?,1,?)
-            ON CONFLICT(username) DO UPDATE SET
-                phone=excluded.phone,
-                password_hash=excluded.password_hash,
-                status='active',
-                plan=excluded.plan,
-                license_expiry=excluded.license_expiry,
-                device_id=excluded.device_id,
-                token=excluded.token,
-                must_change_password=1
-            """,
-            (username, phone, password_hash, "active", plan, expiry, device_id or "", token, utc_now()),
-        )
-        conn.commit()
+
+    sb_upsert(
+        "users",
+        {
+            "username": username,
+            "phone": phone,
+            "password_hash": password_hash,
+            "status": "active",
+            "plan": plan,
+            "license_expiry": expiry,
+            "device_id": device_id or "",
+            "token": token,
+            "must_change_password": True,
+            "created_at": utc_now(),
+            "last_login": None,
+        },
+        "username",
+    )
     return {"username": username, "temporary_password": temp_password, "license_expiry": expiry, "token": token}
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
-
-
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
 @app.get("/")
 def home() -> Dict[str, Any]:
-    return {"status": "running", "service": "Tweet Pipeline Pro License Server", "time": utc_now()}
+    return {
+        "status": "running",
+        "service": "Tweet Pipeline Pro License Server",
+        "storage": "supabase",
+        "time": utc_now(),
+    }
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    require_supabase()
+    # Verifies that tables exist.
+    settings_ok = sb_select("settings", {"select": "key", "limit": "1"})
+    payments_ok = sb_select("payments", {"select": "id", "limit": "1"})
+    users_ok = sb_select("users", {"select": "id", "limit": "1"})
+    ensure_default_settings()
+    return {
+        "status": "ok",
+        "supabase": "connected",
+        "settings_table": True,
+        "payments_table": True,
+        "users_table": True,
+        "time": utc_now(),
+    }
 
 
 @app.get("/api/public/config")
 def public_config() -> Dict[str, Any]:
+    ensure_default_settings()
     return {
         "weekly_price": plan_amount("weekly"),
         "monthly_price": plan_amount("monthly"),
@@ -309,7 +362,7 @@ def public_config() -> Dict[str, Any]:
 
 
 @app.post("/api/admin/settings")
-def update_admin_settings(payload: Dict[str, Any], _ok: None = None, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def update_admin_settings(payload: Dict[str, Any], x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     require_admin(x_admin_token)
     allowed = {
         "DARAJA_ENV", "DARAJA_CONSUMER_KEY", "DARAJA_CONSUMER_SECRET", "DARAJA_SHORTCODE", "DARAJA_PASSKEY",
@@ -330,6 +383,7 @@ def read_admin_settings(x_admin_token: Optional[str] = Header(default=None)) -> 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(token: str = "") -> str:
+    ensure_default_settings()
     real_token = setting("SERVER_ADMIN_TOKEN", DEFAULT_ADMIN_TOKEN)
     if not token or not secrets.compare_digest(token, real_token):
         return """
@@ -339,27 +393,44 @@ def admin_page(token: str = "") -> str:
         <form method='get'><input name='token' type='password' style='width:360px;padding:8px'> <button>Open</button></form>
         </body></html>
         """
+
     s = all_settings(mask_secret=False)
-    with db() as conn:
-        payments = conn.execute("SELECT * FROM payments ORDER BY id DESC LIMIT 50").fetchall()
-        users = conn.execute("SELECT username, phone, plan, status, license_expiry, device_id, created_at FROM users ORDER BY id DESC LIMIT 50").fetchall()
+    payments = sb_select("payments", {"select": "*", "order": "id.desc", "limit": "50"})
+    users = sb_select("users", {"select": "username,phone,plan,status,license_expiry,device_id,created_at", "order": "id.desc", "limit": "50"})
+
     def esc(x: Any) -> str:
         import html
         return html.escape(str(x or ""))
+
     setting_rows = "".join(
         f"<label>{esc(k)}</label><input name='{esc(k)}' value='{esc(v)}' {'type=password' if ('SECRET' in k or 'PASSKEY' in k or 'TOKEN' in k) else ''}>"
         for k, v in s.items()
     )
-    payment_rows = "".join(f"<tr><td>{p['id']}</td><td>{esc(p['phone'])}</td><td>{p['amount']}</td><td>{esc(p['plan'])}</td><td>{esc(p['status'])}</td><td>{esc(p['mpesa_receipt'])}</td><td>{esc(p['username'])}</td><td>{esc(p['created_at'])}</td></tr>" for p in payments)
-    user_rows = "".join(f"<tr><td>{esc(u['username'])}</td><td>{esc(u['phone'])}</td><td>{esc(u['plan'])}</td><td>{esc(u['status'])}</td><td>{esc(u['license_expiry'])}</td><td>{esc(u['device_id'])}</td></tr>" for u in users)
+    payment_rows = "".join(
+        f"<tr><td>{p.get('id')}</td><td>{esc(p.get('phone'))}</td><td>{p.get('amount')}</td><td>{esc(p.get('plan'))}</td><td>{esc(p.get('status'))}</td><td>{esc(p.get('result_desc'))}</td><td>{esc(p.get('mpesa_receipt'))}</td><td>{esc(p.get('username'))}</td><td>{esc(p.get('created_at'))}</td></tr>"
+        for p in payments
+    )
+    user_rows = "".join(
+        f"<tr><td>{esc(u.get('username'))}</td><td>{esc(u.get('phone'))}</td><td>{esc(u.get('plan'))}</td><td>{esc(u.get('status'))}</td><td>{esc(u.get('license_expiry'))}</td><td>{esc(u.get('device_id'))}</td></tr>"
+        for u in users
+    )
+
     return f"""
     <html><head><title>TPP License Server Admin</title>
-    <style>body{{font-family:Segoe UI,Arial;background:#0f172a;color:#e5e7eb;padding:24px}} .card{{background:#111827;border-radius:14px;padding:18px;margin:12px 0}} label{{display:block;margin-top:10px;color:#93c5fd}} input{{width:100%;padding:9px;border-radius:8px;border:1px solid #334155;background:#020617;color:#e5e7eb}} button{{padding:10px 16px;border:0;border-radius:8px;background:#38bdf8;font-weight:bold;margin-top:12px}} table{{width:100%;border-collapse:collapse}}td,th{{border-bottom:1px solid #334155;padding:7px;font-size:12px}}</style></head>
+    <style>
+    body{{font-family:Segoe UI,Arial;background:#0f172a;color:#e5e7eb;padding:24px}}
+    .card{{background:#111827;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 10px 30px #0004}}
+    label{{display:block;margin-top:10px;color:#93c5fd;font-weight:600}}
+    input{{width:100%;padding:9px;border-radius:8px;border:1px solid #334155;background:#020617;color:#e5e7eb}}
+    button{{padding:10px 16px;border:0;border-radius:8px;background:#38bdf8;font-weight:bold;margin-top:12px;cursor:pointer}}
+    table{{width:100%;border-collapse:collapse}}td,th{{border-bottom:1px solid #334155;padding:7px;font-size:12px;text-align:left}}
+    code{{background:#020617;padding:3px 6px;border-radius:6px}}
+    </style></head>
     <body><h1>Tweet Pipeline Pro License Server Admin</h1>
     <div class='card'><h2>Payment / Daraja Settings</h2>
     <form method='post' action='/admin/save?token={quote(token)}'>{setting_rows}<button>Save Settings</button></form>
-    <p>Callback URL to put in Daraja/server setting: <b>{esc(s.get('DARAJA_CALLBACK_URL'))}</b></p></div>
-    <div class='card'><h2>Recent Payments</h2><table><tr><th>ID</th><th>Phone</th><th>Amount</th><th>Plan</th><th>Status</th><th>Receipt</th><th>Username</th><th>Created</th></tr>{payment_rows}</table></div>
+    <p>Callback URL: <code>{esc(s.get('DARAJA_CALLBACK_URL'))}</code></p></div>
+    <div class='card'><h2>Recent Payments</h2><table><tr><th>ID</th><th>Phone</th><th>Amount</th><th>Plan</th><th>Status</th><th>Result</th><th>Receipt</th><th>Username</th><th>Created</th></tr>{payment_rows}</table></div>
     <div class='card'><h2>Users</h2><table><tr><th>Username</th><th>Phone</th><th>Plan</th><th>Status</th><th>Expiry</th><th>Device</th></tr>{user_rows}</table></div>
     </body></html>
     """
@@ -378,15 +449,18 @@ async def admin_save(request: Request, token: str = "") -> HTMLResponse:
 
 @app.post("/api/payment/start")
 def start_payment(payload: PaymentStartRequest) -> Dict[str, Any]:
+    ensure_default_settings()
     phone = normalize_phone(payload.phone)
     plan = (payload.plan or "monthly").lower()
     amount = int(payload.amount or plan_amount(plan))
     if amount < 1:
         raise HTTPException(status_code=400, detail="Amount must be at least 1 KES.")
+
     shortcode = setting("DARAJA_SHORTCODE", "174379")
     callback = setting("DARAJA_CALLBACK_URL")
     if not callback:
-        raise HTTPException(status_code=400, detail="Callback URL is not configured on server admin page.")
+        raise HTTPException(status_code=400, detail="Callback URL is not configured.")
+
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     body = {
         "BusinessShortCode": shortcode,
@@ -401,23 +475,36 @@ def start_payment(payload: PaymentStartRequest) -> Dict[str, Any]:
         "AccountReference": setting("ACCOUNT_REFERENCE", "TweetPro")[:12] or "TweetPro",
         "TransactionDesc": setting("TRANSACTION_DESC", "License")[:13] or "License",
     }
+
     token = get_access_token()
-    response = requests.post(stk_url(), json=body, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, timeout=35)
+    response = requests.post(
+        stk_url(),
+        json=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=35,
+    )
     try:
         data = response.json()
     except Exception:
         data = {"raw": response.text}
+
     if response.status_code != 200 or data.get("ResponseCode") != "0":
         raise HTTPException(status_code=400, detail=data)
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO payments(phone, amount, plan, device_id, merchant_request_id, checkout_request_id, status, created_at)
-            VALUES(?,?,?,?,?,?, 'pending', ?)
-            """,
-            (phone, amount, plan, payload.device_id or "", data.get("MerchantRequestID", ""), data.get("CheckoutRequestID", ""), utc_now()),
-        )
-        conn.commit()
+
+    sb_insert(
+        "payments",
+        {
+            "phone": phone,
+            "amount": amount,
+            "plan": plan,
+            "device_id": payload.device_id or "",
+            "merchant_request_id": data.get("MerchantRequestID", ""),
+            "checkout_request_id": data.get("CheckoutRequestID", ""),
+            "status": "pending",
+            "created_at": utc_now(),
+        },
+    )
+
     return {
         "status": "pending",
         "message": "STK Push sent. Enter your M-Pesa PIN.",
@@ -433,102 +520,125 @@ async def mpesa_callback(request: Request) -> Dict[str, Any]:
     checkout_id = stk.get("CheckoutRequestID")
     result_code = stk.get("ResultCode")
     result_desc = stk.get("ResultDesc", "")
+
     if not checkout_id:
         return {"ResultCode": 1, "ResultDesc": "Missing CheckoutRequestID"}
-    with db() as conn:
-        payment = conn.execute("SELECT * FROM payments WHERE checkout_request_id=?", (checkout_id,)).fetchone()
-        if not payment:
-            return {"ResultCode": 1, "ResultDesc": "Payment not found"}
-        if int(result_code or -1) == 0:
-            receipt = ""
-            amount = payment["amount"]
-            callback_phone = payment["phone"]
-            for item in stk.get("CallbackMetadata", {}).get("Item", []):
-                if item.get("Name") == "MpesaReceiptNumber": receipt = str(item.get("Value", ""))
-                if item.get("Name") == "PhoneNumber": callback_phone = str(item.get("Value", callback_phone))
-                if item.get("Name") == "Amount":
-                    try: amount = int(float(item.get("Value", amount)))
-                    except Exception: pass
-            creds = create_or_update_paid_user(payment["phone"], payment["plan"], payment["device_id"])
-            conn.execute(
-                """
-                UPDATE payments SET status='paid', result_code=?, result_desc=?, mpesa_receipt=?, username=?, temp_password=?, paid_at=?
-                WHERE checkout_request_id=?
-                """,
-                (result_code, result_desc, receipt, creds["username"], creds["temporary_password"], utc_now(), checkout_id),
-            )
-        else:
-            status = "cancelled" if int(result_code or -1) == 1032 else "failed"
-            conn.execute("UPDATE payments SET status=?, result_code=?, result_desc=? WHERE checkout_request_id=?", (status, result_code, result_desc, checkout_id))
-        conn.commit()
+
+    rows = sb_select("payments", {"select": "*", "checkout_request_id": f"eq.{checkout_id}", "limit": "1"})
+    if not rows:
+        # This is useful to diagnose callback arriving before/without stored request.
+        sb_insert(
+            "payments",
+            {
+                "phone": "unknown",
+                "amount": 0,
+                "plan": "unknown",
+                "device_id": "",
+                "merchant_request_id": stk.get("MerchantRequestID", ""),
+                "checkout_request_id": checkout_id,
+                "status": "callback_without_payment",
+                "result_code": int(result_code or -1),
+                "result_desc": result_desc or "Payment not found for callback",
+                "created_at": utc_now(),
+            },
+        )
+        return {"ResultCode": 0, "ResultDesc": "Callback stored without matching payment"}
+
+    payment = rows[0]
+    if int(result_code or -1) == 0:
+        receipt = ""
+        for item in stk.get("CallbackMetadata", {}).get("Item", []):
+            if item.get("Name") == "MpesaReceiptNumber":
+                receipt = str(item.get("Value", ""))
+
+        creds = create_or_update_paid_user(payment["phone"], payment["plan"], payment.get("device_id") or "")
+        sb_update(
+            "payments",
+            {"checkout_request_id": f"eq.{checkout_id}"},
+            {
+                "status": "paid",
+                "result_code": int(result_code),
+                "result_desc": result_desc,
+                "mpesa_receipt": receipt,
+                "username": creds["username"],
+                "temp_password": creds["temporary_password"],
+                "paid_at": utc_now(),
+            },
+        )
+    else:
+        status = "cancelled" if int(result_code or -1) == 1032 else "failed"
+        sb_update(
+            "payments",
+            {"checkout_request_id": f"eq.{checkout_id}"},
+            {"status": status, "result_code": int(result_code or -1), "result_desc": result_desc},
+        )
+
     return {"ResultCode": 0, "ResultDesc": "Callback received"}
 
 
 @app.get("/api/payment/status/{checkout_request_id}")
 def payment_status(checkout_request_id: str) -> Dict[str, Any]:
-    with db() as conn:
-        p = conn.execute("SELECT * FROM payments WHERE checkout_request_id=?", (checkout_request_id,)).fetchone()
-    if not p:
+    rows = sb_select("payments", {"select": "*", "checkout_request_id": f"eq.{checkout_request_id}", "limit": "1"})
+    if not rows:
         raise HTTPException(status_code=404, detail="Payment not found")
+    p = rows[0]
     if p["status"] == "paid":
         return {
             "status": "paid",
             "message": "Payment confirmed. Login details created.",
-            "username": p["username"],
-            "temporary_password": p["temp_password"],
-            "plan": p["plan"],
-            "amount": p["amount"],
-            "mpesa_receipt": p["mpesa_receipt"],
+            "username": p.get("username"),
+            "temporary_password": p.get("temp_password"),
+            "plan": p.get("plan"),
+            "amount": p.get("amount"),
+            "mpesa_receipt": p.get("mpesa_receipt"),
         }
-    if p["status"] in {"failed", "cancelled", "expired"}:
-        return {"status": p["status"], "message": p["result_desc"] or "Payment failed/cancelled."}
+    if p["status"] in {"failed", "cancelled", "expired", "callback_without_payment"}:
+        return {"status": p["status"], "message": p.get("result_desc") or "Payment failed/cancelled."}
     return {"status": "pending", "message": "Waiting for M-Pesa confirmation."}
 
 
 @app.post("/api/auth/login")
 def login(payload: LoginRequest) -> Dict[str, Any]:
-    with db() as conn:
-        user = conn.execute("SELECT * FROM users WHERE username=?", (payload.username.strip(),)).fetchone()
-        if not user or user["status"] != "active" or not verify_password(payload.password, user["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid username/password or inactive account.")
-        if user["license_expiry"]:
-            exp = datetime.fromisoformat(user["license_expiry"].replace("Z", "+00:00"))
-            if exp < datetime.now(timezone.utc):
-                raise HTTPException(status_code=403, detail="License expired.")
-        if user["device_id"] and payload.device_id and user["device_id"] != payload.device_id:
-            raise HTTPException(status_code=403, detail="License is locked to another device.")
-        if payload.device_id and not user["device_id"]:
-            conn.execute("UPDATE users SET device_id=? WHERE id=?", (payload.device_id, user["id"]))
-        conn.execute("UPDATE users SET last_login=? WHERE id=?", (utc_now(), user["id"]))
-        conn.commit()
-        return {
-            "status": "success",
-            "username": user["username"],
-            "phone": user["phone"],
-            "plan": user["plan"],
-            "license_expiry": user["license_expiry"],
-            "token": user["token"],
-            "must_change_password": bool(user["must_change_password"]),
-        }
+    rows = sb_select("users", {"select": "*", "username": f"eq.{payload.username.strip()}", "limit": "1"})
+    if not rows:
+        raise HTTPException(status_code=401, detail="Invalid username/password or inactive account.")
+    user = rows[0]
+    if user.get("status") != "active" or not verify_password(payload.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid username/password or inactive account.")
+    if user.get("license_expiry"):
+        exp = datetime.fromisoformat(str(user["license_expiry"]).replace("Z", "+00:00"))
+        if exp < datetime.now(timezone.utc):
+            raise HTTPException(status_code=403, detail="License expired.")
+    if user.get("device_id") and payload.device_id and user.get("device_id") != payload.device_id:
+        raise HTTPException(status_code=403, detail="License is locked to another device.")
+    if payload.device_id and not user.get("device_id"):
+        sb_update("users", {"id": f"eq.{user['id']}"}, {"device_id": payload.device_id, "last_login": utc_now()})
+    else:
+        sb_update("users", {"id": f"eq.{user['id']}"}, {"last_login": utc_now()})
+
+    return {
+        "status": "success",
+        "username": user.get("username"),
+        "phone": user.get("phone"),
+        "plan": user.get("plan"),
+        "license_expiry": user.get("license_expiry"),
+        "token": user.get("token"),
+        "must_change_password": bool(user.get("must_change_password")),
+    }
 
 
 @app.post("/api/license/check")
 def license_check(payload: LicenseCheckRequest) -> Dict[str, Any]:
-    with db() as conn:
-        user = conn.execute("SELECT * FROM users WHERE token=?", (payload.token,)).fetchone()
-    if not user or user["status"] != "active":
+    rows = sb_select("users", {"select": "*", "token": f"eq.{payload.token}", "limit": "1"})
+    if not rows:
         raise HTTPException(status_code=403, detail="License inactive.")
-    if user["license_expiry"]:
-        exp = datetime.fromisoformat(user["license_expiry"].replace("Z", "+00:00"))
+    user = rows[0]
+    if user.get("status") != "active":
+        raise HTTPException(status_code=403, detail="License inactive.")
+    if user.get("license_expiry"):
+        exp = datetime.fromisoformat(str(user["license_expiry"]).replace("Z", "+00:00"))
         if exp < datetime.now(timezone.utc):
             raise HTTPException(status_code=403, detail="License expired.")
-    if user["device_id"] and payload.device_id and user["device_id"] != payload.device_id:
+    if user.get("device_id") and payload.device_id and user.get("device_id") != payload.device_id:
         raise HTTPException(status_code=403, detail="License locked to another device.")
-    return {"status": "active", "username": user["username"], "plan": user["plan"], "license_expiry": user["license_expiry"]}
-
-
-# Initialize when module is imported. This helps serverless platforms.
-try:
-    init_db()
-except Exception as exc:
-    print(f"[TPP] DB init warning: {exc}")
+    return {"status": "active", "username": user.get("username"), "plan": user.get("plan"), "license_expiry": user.get("license_expiry")}

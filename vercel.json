@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "*.py": {
+      "maxDuration": 60
+    }
+  }
+}

@@ -1,11 +1,10 @@
 [project]
 name = "tweetpipeline-license-server"
-version = "1.0.0"
-description = "Tweet Pipeline Pro license server"
+version = "2.0.0"
+description = "Tweet Pipeline Pro license server with Supabase storage"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
-    "uvicorn>=0.30.0",
     "requests>=2.32.0",
     "pydantic>=2.7.0",
     "python-multipart>=0.0.9"

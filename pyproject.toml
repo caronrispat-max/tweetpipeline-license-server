@@ -1,0 +1,2 @@
+[tool.vercel]
+entrypoint = "license_server:app"

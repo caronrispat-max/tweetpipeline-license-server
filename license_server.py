@@ -18,9 +18,23 @@ from pydantic import BaseModel
 from requests.auth import HTTPBasicAuth
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "license_server.db"
 
-DEFAULT_ADMIN_TOKEN = os.getenv("TPP_SERVER_ADMIN_TOKEN", "change-this-admin-token")
+# VERCEL FIX:
+# Serverless functions cannot write beside source files.
+# On Vercel, SQLite must use /tmp. This is for testing only;
+# use Supabase/Postgres later for real paid customers.
+if os.getenv("VERCEL"):
+    DATA_DIR = Path("/tmp")
+else:
+    DATA_DIR = BASE_DIR
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "license_server.db"
+
+DEFAULT_ADMIN_TOKEN = (
+    os.getenv("LICENSE_SERVER_ADMIN_TOKEN")
+    or os.getenv("TPP_SERVER_ADMIN_TOKEN")
+    or "change-this-admin-token"
+)
 
 app = FastAPI(title="Tweet Pipeline Pro License Server")
 
@@ -50,8 +64,13 @@ def utc_now() -> str:
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), timeout=20)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+        # WAL is useful locally but can be unnecessary in serverless.
+        if not os.getenv("VERCEL"):
+            conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        pass
     return conn
 
 
@@ -105,7 +124,7 @@ def init_db() -> None:
             "DARAJA_CONSUMER_SECRET": os.getenv("DARAJA_CONSUMER_SECRET", ""),
             "DARAJA_SHORTCODE": os.getenv("DARAJA_SHORTCODE", "174379"),
             "DARAJA_PASSKEY": os.getenv("DARAJA_PASSKEY", ""),
-            "DARAJA_CALLBACK_URL": os.getenv("CALLBACK_URL", ""),
+            "DARAJA_CALLBACK_URL": os.getenv("DARAJA_CALLBACK_URL", os.getenv("CALLBACK_URL", "")),
             "WEEKLY_PRICE": os.getenv("WEEKLY_PRICE", "500"),
             "MONTHLY_PRICE": os.getenv("MONTHLY_PRICE", "1500"),
             "LIFETIME_PRICE": os.getenv("LIFETIME_PRICE", "15000"),
@@ -506,3 +525,10 @@ def license_check(payload: LicenseCheckRequest) -> Dict[str, Any]:
     if user["device_id"] and payload.device_id and user["device_id"] != payload.device_id:
         raise HTTPException(status_code=403, detail="License locked to another device.")
     return {"status": "active", "username": user["username"], "plan": user["plan"], "license_expiry": user["license_expiry"]}
+
+
+# Initialize when module is imported. This helps serverless platforms.
+try:
+    init_db()
+except Exception as exc:
+    print(f"[TPP] DB init warning: {exc}")

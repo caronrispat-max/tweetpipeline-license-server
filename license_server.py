@@ -28,7 +28,7 @@ if os.getenv("VERCEL"):
 else:
     DATA_DIR = BASE_DIR
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "license_server.db"
+DB_PATH = Path("/tmp/license_server.db")
 
 DEFAULT_ADMIN_TOKEN = (
     os.getenv("LICENSE_SERVER_ADMIN_TOKEN")
